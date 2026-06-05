@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #
+# --- USAGE-START ---  (sentinel for usage(); do not remove)
 # install.sh -- Install The Agency agents into your local agentic tool(s).
 #
 # Reads converted files from integrations/ and copies them to the appropriate
@@ -13,13 +14,14 @@
 #   claude-code  -- Copy agents to ~/.claude/agents/
 #   copilot      -- Copy agents to ~/.github/agents/ and ~/.copilot/agents/
 #   antigravity  -- Copy skills to ~/.gemini/antigravity/skills/
-#   gemini-cli   -- Install extension to ~/.gemini/extensions/agency-agents/
+#   gemini-cli   -- Install agents to ~/.gemini/agents/
 #   opencode     -- Copy agents to .opencode/agents/ in current directory
 #   cursor       -- Copy rules to .cursor/rules/ in current directory
 #   aider        -- Copy CONVENTIONS.md to current directory
 #   windsurf     -- Copy .windsurfrules to current directory
 #   openclaw     -- Copy workspaces to ~/.openclaw/agency-agents/
 #   qwen         -- Copy SubAgents to ~/.qwen/agents/ (user-wide) or .qwen/agents/ (project)
+#   codex        -- Copy custom agent TOML files to ~/.codex/agents/
 #   all          -- Install for all detected tools (default)
 #
 # Flags:
@@ -30,6 +32,7 @@
 #   --jobs N          Max parallel jobs when using --parallel (default: nproc or 4)
 #   --help            Show this help
 #
+# --- USAGE-END ---  (sentinel for usage(); do not remove)
 # Platform support:
 #   Linux, macOS (requires bash 3.2+), Windows Git Bash / WSL
 
@@ -101,19 +104,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INTEGRATIONS="$REPO_ROOT/integrations"
 
-ALL_TOOLS=(claude-code copilot antigravity gemini-cli opencode openclaw cursor aider windsurf qwen kimi)
+ALL_TOOLS=(claude-code copilot antigravity gemini-cli opencode openclaw cursor aider windsurf qwen kimi codex)
 
 # Standard agent category directories (keep sorted, sync with convert.sh / lint-agents.sh)
 AGENT_DIRS=(
   academic design engineering finance game-development marketing paid-media product project-management
-  sales spatial-computing specialized strategy support testing
+  sales security spatial-computing specialized strategy support testing
 )
 
 # ---------------------------------------------------------------------------
 # Usage
 # ---------------------------------------------------------------------------
 usage() {
-  sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'
+  # Extract everything between the USAGE-START / USAGE-END sentinels
+  # (excluding the sentinel lines themselves) and strip the leading "# ".
+  # Using sentinels instead of hard-coded line numbers means adding lines
+  # to the header comment block won't silently break --help output.
+  sed -n '/^# --- USAGE-START ---/,/^# --- USAGE-END ---/p' "$0" \
+    | sed -e '1d;$d' -e 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -149,6 +157,7 @@ detect_openclaw()     { command -v openclaw >/dev/null 2>&1 || [[ -d "${HOME}/.o
 detect_windsurf()     { command -v windsurf >/dev/null 2>&1 || [[ -d "${HOME}/.codeium" ]]; }
 detect_qwen()         { command -v qwen >/dev/null 2>&1 || [[ -d "${HOME}/.qwen" ]]; }
 detect_kimi()         { command -v kimi >/dev/null 2>&1; }
+detect_codex()        { command -v codex >/dev/null 2>&1 || [[ -d "${HOME}/.codex" ]]; }
 
 is_detected() {
   case "$1" in
@@ -163,6 +172,7 @@ is_detected() {
     windsurf)    detect_windsurf    ;;
     qwen)        detect_qwen        ;;
     kimi)        detect_kimi        ;;
+    codex)       detect_codex       ;;
     *)           return 1 ;;
   esac
 }
@@ -173,7 +183,7 @@ tool_label() {
     claude-code) printf "%-14s  %s" "Claude Code"  "(claude.ai/code)"        ;;
     copilot)     printf "%-14s  %s" "Copilot"      "(~/.github + ~/.copilot)" ;;
     antigravity) printf "%-14s  %s" "Antigravity"  "(~/.gemini/antigravity)" ;;
-    gemini-cli)  printf "%-14s  %s" "Gemini CLI"   "(gemini extension)"      ;;
+    gemini-cli)  printf "%-14s  %s" "Gemini CLI"   "(~/.gemini/agents)"      ;;
     opencode)    printf "%-14s  %s" "OpenCode"     "(opencode.ai)"           ;;
     openclaw)    printf "%-14s  %s" "OpenClaw"     "(~/.openclaw/agency-agents)" ;;
     cursor)      printf "%-14s  %s" "Cursor"       "(.cursor/rules)"         ;;
@@ -181,6 +191,7 @@ tool_label() {
     windsurf)    printf "%-14s  %s" "Windsurf"     "(.windsurfrules)"        ;;
     qwen)        printf "%-14s  %s" "Qwen Code"    "(~/.qwen/agents)"        ;;
     kimi)        printf "%-14s  %s" "Kimi Code"    "(~/.config/kimi/agents)" ;;
+    codex)       printf "%-14s  %s" "Codex"        "(~/.codex/agents)"       ;;
   esac
 }
 
@@ -358,24 +369,17 @@ install_antigravity() {
 }
 
 install_gemini_cli() {
-  local src="$INTEGRATIONS/gemini-cli"
-  local dest="${HOME}/.gemini/extensions/agency-agents"
+  local src="$INTEGRATIONS/gemini-cli/agents"
+  local dest="${HOME}/.gemini/agents"
   local count=0
-  local manifest="$src/gemini-extension.json"
-  local skills_dir="$src/skills"
-  [[ -d "$src" ]] || { err "integrations/gemini-cli missing. Run ./scripts/convert.sh --tool gemini-cli first."; return 1; }
-  [[ -f "$manifest" ]] || { err "integrations/gemini-cli/gemini-extension.json missing. Run ./scripts/convert.sh --tool gemini-cli first."; return 1; }
-  [[ -d "$skills_dir" ]] || { err "integrations/gemini-cli/skills missing. Run ./scripts/convert.sh --tool gemini-cli first."; return 1; }
-  mkdir -p "$dest/skills"
-  cp "$manifest" "$dest/gemini-extension.json"
-  local d
-  while IFS= read -r -d '' d; do
-    local name; name="$(basename "$d")"
-    mkdir -p "$dest/skills/$name"
-    cp "$d/SKILL.md" "$dest/skills/$name/SKILL.md"
+  [[ -d "$src" ]] || { err "integrations/gemini-cli/agents missing. Run ./scripts/convert.sh --tool gemini-cli first."; return 1; }
+  mkdir -p "$dest"
+  local f
+  while IFS= read -r -d '' f; do
+    cp "$f" "$dest/"
     (( count++ )) || true
-  done < <(find "$skills_dir" -mindepth 1 -maxdepth 1 -type d -print0)
-  ok "Gemini CLI: $count skills -> $dest"
+  done < <(find "$src" -maxdepth 1 -name "*.md" -print0)
+  ok "Gemini CLI: $count agents -> $dest"
 }
 
 install_opencode() {
@@ -518,6 +522,20 @@ install_kimi() {
   ok "Usage: kimi --agent-file ~/.config/kimi/agents/<agent-name>/agent.yaml"
 }
 
+install_codex() {
+  local src="$INTEGRATIONS/codex/agents"
+  local dest="${HOME}/.codex/agents"
+  local count=0
+  [[ -d "$src" ]] || { err "integrations/codex missing. Run convert.sh first."; return 1; }
+  mkdir -p "$dest"
+  local f
+  while IFS= read -r -d '' f; do
+    cp "$f" "$dest/"
+    (( count++ )) || true
+  done < <(find "$src" -maxdepth 1 -name "*.toml" -print0)
+  ok "Codex: $count agents -> $dest"
+}
+
 install_tool() {
   case "$1" in
     claude-code) install_claude_code ;;
@@ -531,6 +549,7 @@ install_tool() {
     windsurf)    install_windsurf    ;;
     qwen)        install_qwen        ;;
     kimi)        install_kimi        ;;
+    codex)       install_codex       ;;
   esac
 }
 
