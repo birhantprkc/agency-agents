@@ -235,7 +235,9 @@ build_selection() {
 slug_allowed() {
   $SELECTION_ACTIVE || return 0
   local s="${1#agency-}"
-  printf '%s\n' "$_ALLOWED_SLUGS" | grep -qxF "$s"
+  # grep -q closes a pipe as soon as it finds an early match. With pipefail,
+  # printf may then get SIGPIPE and make a valid slug look unselected.
+  grep -qxF "$s" <<< "$_ALLOWED_SLUGS"
 }
 
 # selected_agent_count — how many agents the current selection installs.
@@ -281,7 +283,28 @@ OVERRIDE_PATH=""      # --path (single-destination override)
 
 # install_file <src> <dest> — copy, or symlink when --link is set.
 install_file() {
-  if $USE_LINK; then ln -sf "$1" "$2"; else cp "$1" "$2"; fi
+  if $USE_LINK; then
+    ln -sf "$1" "$2"
+  else
+    local target="$2"
+    [[ -d "$target" ]] && target="${target%/}/$(basename "$1")"
+    if [[ -L "$target" ]]; then
+      # cp would follow the link and overwrite whatever it points at.
+      local link_to; link_to="$(readlink "$target")"
+      if [[ "$link_to" == "$REPO_ROOT/"* ]]; then
+        # Our own --link install: switching to a copy is the intended change.
+        rm -f -- "$target"
+      else
+        # Someone else's link: leave it and its target alone, keep installing
+        # the rest, and say so in the summary (one stray link must not abort
+        # the install halfway through the roster).
+        warn "Skipped $target — it is a symlink to $link_to; not overwriting it."
+        [[ -n "${SKIPPED_LOG:-}" ]] && printf '%s -> %s\n' "$target" "$link_to" >> "$SKIPPED_LOG"
+        return 0
+      fi
+    fi
+    cp "$1" "$2"
+  fi
 }
 
 # resolve_dest <tool> <default> — --path > $ENV_VAR > default.
@@ -297,6 +320,24 @@ path_collision_group() {
     antigravity|osaurus|dsh)         printf 'agency-skill' ;;   # agency-<slug>/SKILL.md
     *)                               printf '' ;;
   esac
+}
+
+# Validate after tool selection so --tool all and the interactive picker get
+# the same protection as an explicit comma-separated list.
+validate_path_collisions() {
+  [[ -n "$OVERRIDE_PATH" && $# -gt 1 ]] || return 0
+  local _ta _tb _ga _gb
+  for _ta in "$@"; do
+    _ga="$(path_collision_group "$_ta")"; [[ -z "$_ga" ]] && continue
+    for _tb in "$@"; do
+      [[ "$_tb" == "$_ta" ]] && continue
+      _gb="$(path_collision_group "$_tb")"
+      if [[ "$_ga" == "$_gb" ]]; then
+        err "--path is one shared directory, and $_ta and $_tb write the same filenames into it — they would overwrite each other. Use one of them per --path (tools with distinct outputs may share one)."
+        return 1
+      fi
+    done
+  done
 }
 
 resolve_dest() {
@@ -361,9 +402,18 @@ ensure_converted() {
   # other than the README count as output.
   if [[ ! -d "$d" ]] || [[ -z "$(find "$d" -type f ! -name 'README.md' 2>/dev/null | head -1)" ]]; then
     warn "$tool: integration files missing — running convert.sh --tool $tool"
-    "$SCRIPT_DIR/convert.sh" --tool "$tool" >/dev/null 2>&1 \
-      && ok "$tool: generated integration files" \
-      || err "$tool: convert.sh failed; run it manually"
+    if "$SCRIPT_DIR/convert.sh" --tool "$tool" >/dev/null 2>&1; then
+      ok "$tool: generated integration files"
+    else
+      # A failed conversion may have written only part of the roster. Remove
+      # that partial output so the next install retries conversion instead of
+      # treating it as a complete generated integration.
+      if [[ -d "$d" ]]; then
+        find "$d" -mindepth 1 -maxdepth 1 ! -name 'README.md' -exec rm -rf {} +
+      fi
+      err "$tool: convert.sh failed; run it manually"
+      return 1
+    fi
   fi
 }
 AUTO_CONVERT=true     # --no-convert disables
@@ -779,21 +829,27 @@ install_claude_code() {
 
 install_copilot() {
   local dest_github; dest_github="$(resolve_dest copilot "${HOME}/.github/agents")"
-  local dest_copilot="${HOME}/.copilot/agents"
+  local dest_copilot=""
+  # The two default locations are intentional, but an explicit destination
+  # must not also write into the user's default Copilot directory.
+  if [[ -z "$OVERRIDE_PATH" && -z "${COPILOT_AGENT_DIR:-}" ]]; then
+    dest_copilot="${HOME}/.copilot/agents"
+  fi
   local count=0 dir f slug
-  mkdir -p "$dest_github" "$dest_copilot"
+  mkdir -p "$dest_github"
+  [[ -n "$dest_copilot" ]] && mkdir -p "$dest_copilot"
   for dir in "${AGENT_DIRS[@]}"; do
     [[ -d "$REPO_ROOT/$dir" ]] || continue
     while IFS= read -r -d '' f; do
       is_agent_file "$f" || continue
       slug="$(agent_slug "$f")"; slug_allowed "$slug" || continue
       install_file "$f" "$dest_github/"
-      install_file "$f" "$dest_copilot/"
+      [[ -n "$dest_copilot" ]] && install_file "$f" "$dest_copilot/"
       incr count
     done < <(find "$REPO_ROOT/$dir" -name "*.md" -type f -print0)
   done
   ok "Copilot: $count agents -> $dest_github"
-  ok "Copilot: $count agents -> $dest_copilot"
+  [[ -n "$dest_copilot" ]] && ok "Copilot: $count agents -> $dest_copilot"
   warn "Copilot: Verify VS Code setting 'chat.agentFilesLocations' includes your install path."
   dim  "         Open Settings (Ctrl/Cmd+,) -> search 'chat.agentFilesLocations'"
 }
@@ -898,10 +954,19 @@ install_openclaw() {
   local dest; dest="$(resolve_dest openclaw "${HOME}/.openclaw/agency-agents")"
   local count=0
   local existing_agents=""
+  local failed_names=""   # a string, not an array: bash 3.2 + set -u rejects "${empty[@]}"
   [[ -d "$src" ]] || { err "integrations/openclaw missing. Run convert.sh first."; return 1; }
   mkdir -p "$dest"
   if command -v openclaw >/dev/null 2>&1; then
-    existing_agents=$'\n'"$(openclaw agents list --json 2>/dev/null | sed -n 's/^[[:space:]]*\"id\": \"\\([^\"]*\\)\".*/\\1/p')"$'\n'
+    local agents_json
+    if ! agents_json="$(openclaw agents list --json 2>/dev/null)"; then
+      err "OpenClaw: could not list registered agents; refusing to guess which workspaces need registration."
+      return 1
+    fi
+    # IDs may appear in compact or pretty JSON, and several may share a line.
+    # Agent IDs are slugs, so quoted id tokens need no JSON parser dependency.
+    existing_agents=$'\n'"$(printf '%s' "$agents_json" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]*"' \
+      | sed -E 's/^"id"[[:space:]]*:[[:space:]]*"([^"]*)"$/\1/' || true)"$'\n'
   fi
   local d
   while IFS= read -r -d '' d; do
@@ -914,7 +979,12 @@ install_openclaw() {
     install_file "$d/IDENTITY.md" "$dest/$name/IDENTITY.md"
     if command -v openclaw >/dev/null 2>&1; then
       if [[ "$existing_agents" != *$'\n'"$name"$'\n'* ]]; then
-        openclaw agents add "$name" --workspace "$dest/$name" --non-interactive || true
+        if ! openclaw agents add "$name" --workspace "$dest/$name" --non-interactive; then
+          err "OpenClaw: failed to register '$name'; the copied workspace is not active."
+          # Keep registering the rest: one bad registration must not cost the others.
+          failed_names="${failed_names:+$failed_names }$name"
+          continue
+        fi
       fi
     fi
     (( count++ )) || true
@@ -926,6 +996,10 @@ install_openclaw() {
   ok "OpenClaw: $count workspaces -> $dest"
   if command -v openclaw >/dev/null 2>&1; then
     warn "OpenClaw: run 'openclaw gateway restart' to activate new agents"
+  fi
+  if [[ -n "$failed_names" ]]; then
+    err "OpenClaw: not registered: $failed_names. Their workspaces are copied; re-run to retry registration."
+    return 1
   fi
 }
 
@@ -946,8 +1020,10 @@ install_cursor() {
 
 install_aider() {
   local src="$INTEGRATIONS/aider/CONVENTIONS.md"
-  local dest="${PWD}/CONVENTIONS.md"
+  local dest_dir; dest_dir="$(resolve_dest aider "$PWD")"
+  local dest="$dest_dir/CONVENTIONS.md"
   [[ -f "$src" ]] || { err "integrations/aider/CONVENTIONS.md missing. Run convert.sh first."; return 1; }
+  mkdir -p "$dest_dir"
   if [[ -f "$dest" ]]; then
     # Never overwrite: CONVENTIONS.md is aider's own user-authored file, and the
     # one sitting here may well be the reader's rather than ours. But the guard
@@ -977,8 +1053,10 @@ install_aider() {
 
 install_windsurf() {
   local src="$INTEGRATIONS/windsurf/.windsurfrules"
-  local dest="${PWD}/.windsurfrules"
+  local dest_dir; dest_dir="$(resolve_dest windsurf "$PWD")"
+  local dest="$dest_dir/.windsurfrules"
   [[ -f "$src" ]] || { err "integrations/windsurf/.windsurfrules missing. Run convert.sh first."; return 1; }
+  mkdir -p "$dest_dir"
   if [[ -f "$dest" ]]; then
     warn "Windsurf: .windsurfrules already exists at $dest (remove to reinstall)."
     return 0
@@ -1113,7 +1191,7 @@ ensure_hermes_plugin_enabled() {
   mkdir -p "$hermes_home"
   backup="${config}.bak.agency-agents-plugin.$$"
   [[ -f "$config" ]] && cp "$config" "$backup"
-  python3 - "$config" "$plugin" <<'PY'
+  python3 - "$config" "$plugin" <<'PY' || return 1
 from pathlib import Path
 import sys
 import re
@@ -1124,16 +1202,14 @@ text = path.read_text() if path.exists() else ""
 lines = text.splitlines()
 plugin_strip = plugin.strip()
 
-# Locate the plugins block boundaries, the indent of the enabled: key, and
-# the indent of any existing list items beneath it. Tracking these explicitly
-# avoids the previous bug where the script hardcoded "  " and broke any
-# config that used a different list-item indent (Hermes' default is 4 spaces).
+# plugins block + enabled: key/indent/rest. Avoids old 2-space hardcode and cross-list scan into disabled:/entries: (#879).
 plugin_start = None
 end_line = None
+enabled_idx = None
 enabled_indent = ""
+enabled_rest = ""
 item_indent = ""
 has_enabled = False
-enabled_empty = False
 for i, line in enumerate(lines):
     if line.startswith("plugins:"):
         plugin_start = i
@@ -1141,50 +1217,90 @@ for i, line in enumerate(lines):
         broke = False
         while j < len(lines):
             jl = lines[j]
-            if jl and not jl.startswith((" ", "\t")):
+            # Only a top-level KEY ends the block. Hermes writes enabled:/disabled: below a
+            # column-0 "# ====" section banner; treating that comment as the end hid them.
+            if jl and not jl.startswith((" ", "\t")) and not jl.startswith("#"):
                 broke = True
                 break
             stripped = jl.strip()
-            if stripped.startswith("enabled:") and not enabled_indent:
+            if stripped.startswith("enabled:") and not has_enabled:
                 has_enabled = True
+                enabled_idx = j
                 enabled_indent = jl[: len(jl) - len(stripped)]
-                if "[]" in stripped:
-                    enabled_empty = True
-            elif stripped.startswith("-") and has_enabled and not item_indent:
-                item_indent = jl[: len(jl) - len(stripped)]
+                enabled_rest = stripped[len("enabled:") :].strip()
             j += 1
-        # If the inner loop ran off the end of the file (no sibling key to
-        # break on), end_line must still point one past the last scanned line
-        # so subsequent inserts land at the right place.
+        # ran off EOF: end_line = one past last scanned line so inserts land right.
         end_line = j if broke else len(lines)
         break
 
-# Detect both "plugin already enabled" and the corrupted-scalar failure mode.
-# The previous bug emitted a 2-space-indent entry under a 4-space-indented
-# list, which PyYAML parses as a plain scalar string:
-#   plugins.enabled: ['agency-agents-router - basic - chronos - ponytail']
-# The file on disk still has literal "- " markers glued together — we repair
-# it by splitting the line back into one item per line.
+# plugins: must be bare key; inline {} or scalar can't be edited line-wise — bail.
+if plugin_start is not None:
+    if re.sub(r"\s*#.*$", "", lines[plugin_start]).strip() != "plugins:":
+        sys.exit(1)
+
+# Classify enabled: rest: empty (block), [] (empty), [a,b] (flow); else bail.
+enabled_empty = False
+inline_flow = False
+inline_items = []
+inline_comment = ""
+if has_enabled:
+    rest_nc = re.sub(r"\s*#.*$", "", enabled_rest).strip()
+    if rest_nc == "":
+        pass  # block-style list (or an empty key) — handled below
+    elif re.fullmatch(r"\[[^\[\]]*\]", rest_nc):
+        inner = rest_nc[1:-1]
+        inline_items = [
+            p.strip().strip("\"'") for p in inner.split(",") if p.strip()
+        ]
+        if inline_items:
+            inline_flow = True
+            inline_comment = enabled_rest[enabled_rest.find("]") + 1 :]
+        else:
+            enabled_empty = True
+    else:
+        sys.exit(1)
+
+# enabled: sub-block ends at first sibling key (indent <= enabled_indent); blanks/comments/items don't end it (#879).
+enabled_end = end_line
+if has_enabled:
+    for j in range(enabled_idx + 1, end_line):
+        line = lines[j]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        this_indent = line[: len(line) - len(stripped)]
+        if not stripped.startswith("-") and len(this_indent) <= len(enabled_indent):
+            enabled_end = j
+            break
+
+# item_indent from within (enabled_idx, enabled_end) so sibling lists can't leak in (#879).
+if has_enabled and not enabled_empty and not inline_flow:
+    for idx in range(enabled_idx + 1, enabled_end):
+        stripped = lines[idx].strip()
+        if stripped.startswith("-"):
+            item_indent = lines[idx][: len(lines[idx]) - len(stripped)]
+            break
+
+# Detect "already enabled" + corrupted-scalar form (glued "- " from old 2-space bug); repair splits to one per line.
 corrupted_lines = []
 has_plugin_already = False
-if has_enabled and not enabled_empty:
-    for idx in range(plugin_start + 1, end_line):
+if inline_flow:
+    has_plugin_already = plugin_strip in inline_items
+elif has_enabled and not enabled_empty:
+    for idx in range(enabled_idx + 1, enabled_end):
         l = lines[idx]
         stripped = l.strip()
         if not stripped.startswith("-"):
             continue
-        # Count "- " occurrences in the full stripped line. A healthy item
-        # has exactly one (the leading "- " marker); a corrupted glued line
-        # has more. We can't use whitespace-strict matching because words
-        # like "agency-agents-router" contain dashes.
+        # >1 "- " in stripped line = corrupted glue (strict match won't work: names contain dashes).
         if stripped.count("- ") > 1:
             corrupted_lines.append(idx)
         else:
-            value = stripped[1:].strip().strip('"\'')
+            value = stripped[1:].strip().strip("\"'")
             if value == plugin_strip:
                 has_plugin_already = True
 
-# Repair corrupted lines (reverse order so indices stay valid as we splice).
+# Repair in reverse to keep indices. Splice grows the block — sync enabled_end with end_line or the stale sweep eats the new plugin (#879).
 for idx in sorted(corrupted_lines, reverse=True):
     l = lines[idx]
     stripped = l.strip()
@@ -1197,12 +1313,39 @@ for idx in sorted(corrupted_lines, reverse=True):
         new_lines.append(f"{item_indent}- {p}")
     lines[idx : idx + 1] = new_lines
     end_line += len(new_lines) - 1
-    # Re-evaluate plugin presence after the rewrite.
+    enabled_end += len(new_lines) - 1
+    # Re-check presence after rewrite.
     has_plugin_already = False
-    for nl in lines[plugin_start + 1 : end_line]:
-        if nl.strip().startswith("-") and nl[len(item_indent):].strip() == f"- {plugin_strip}":
+    for nl in lines[enabled_idx + 1 : enabled_end]:
+        if nl.strip().startswith("-") and nl[len(item_indent) :].strip() == f"- {plugin_strip}":
             has_plugin_already = True
             break
+
+# Remove stale plugin entries elsewhere in the block (disabled:, entries:); sweep whole block if no enabled: yet (#879).
+if plugin_start is not None:
+    stale = []
+    if has_enabled:
+        scan_ranges = [
+            range(plugin_start + 1, enabled_idx),
+            range(enabled_end, end_line),
+        ]
+    else:
+        scan_ranges = [range(plugin_start + 1, end_line)]
+    for rng in scan_ranges:
+        for idx in rng:
+            stripped = lines[idx].strip()
+            if stripped.startswith("-"):
+                value = stripped[1:].strip().strip("\"'")
+                if value == plugin_strip:
+                    stale.append(idx)
+    for idx in sorted(stale, reverse=True):
+        del lines[idx]
+        end_line -= 1
+        if has_enabled and idx < enabled_idx:
+            enabled_idx -= 1
+            enabled_end -= 1
+        elif has_enabled and idx < enabled_end:
+            enabled_end -= 1
 
 # Idempotent fast path.
 if has_plugin_already:
@@ -1221,31 +1364,49 @@ if plugin_start is None:
     path.write_text("\n".join(lines) + "\n")
     sys.exit(0)
 
-# Case 2: enabled: [] (inline empty) — replace with a block-style list.
+# Case 2: no enabled: key — create as first child at existing child indent (else sibling items dedent to col 0 → invalid YAML).
+if not has_enabled:
+    child_indent = ""
+    for idx in range(plugin_start + 1, end_line):
+        stripped = lines[idx].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        child_indent = lines[idx][: len(lines[idx]) - len(stripped)]
+        break
+    child_indent = child_indent or "  "
+    lines[plugin_start + 1 : plugin_start + 1] = [
+        f"{child_indent}enabled:",
+        f"{child_indent}  - {plugin}",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+    sys.exit(0)
+
+# Case 3: enabled: [] — replace key line with block list (keyed off enabled_idx; disabled: may precede).
 if enabled_empty:
     new_block = [
         f"{enabled_indent}enabled:",
         new_item_line,
     ]
-    lines[plugin_start + 1 : plugin_start + 2] = new_block
+    lines[enabled_idx : enabled_idx + 1] = new_block
     path.write_text("\n".join(lines) + "\n")
     sys.exit(0)
 
-# Case 3: enabled: block exists but has no items yet.
-if has_enabled and not item_indent and not enabled_empty:
-    for idx in range(plugin_start + 1, end_line):
-        if lines[idx].strip() == "enabled:":
-            lines.insert(idx + 1, new_item_line)
-            break
+# Case 4: enabled: [a,b] — append inside brackets, keep trailing comment.
+if inline_flow:
+    rendered = "[" + ", ".join(inline_items + [plugin_strip]) + "]"
+    lines[enabled_idx] = f"{enabled_indent}enabled: {rendered}{inline_comment}"
     path.write_text("\n".join(lines) + "\n")
     sys.exit(0)
 
-# Case 4: enabled: block with existing items — append at the end of the list
-# at the matching indent. Also normalize any sibling items whose indent
-# doesn't match (e.g. the original 2-space bug entry) so the file is left
-# consistent.
+# Case 5: block-style enabled: key with no items yet.
+if not item_indent:
+    lines.insert(enabled_idx + 1, new_item_line)
+    path.write_text("\n".join(lines) + "\n")
+    sys.exit(0)
+
+# Case 6: append at end of enabled block at item indent, never past enabled_end; normalize mismatched indents (#879).
 insert_at = None
-for idx in range(end_line - 1, plugin_start, -1):
+for idx in range(enabled_end - 1, enabled_idx, -1):
     l = lines[idx]
     stripped = l.strip()
     if stripped.startswith("-"):
@@ -1253,17 +1414,9 @@ for idx in range(end_line - 1, plugin_start, -1):
             lines[idx] = item_indent + stripped
         insert_at = idx + 1
         break
-# Fallback: no item line found in the scan (shouldn't happen if has_enabled
-# is True, but stay correct). Insert directly under the enabled: key.
-if insert_at is None and has_enabled:
-    for idx in range(plugin_start + 1, end_line):
-        if lines[idx].strip() == "enabled:":
-            insert_at = idx + 1
-            break
+# Fallback: insert under the enabled: key (shouldn't happen after Case 5).
 if insert_at is None:
-    # Couldn't locate a sensible insertion point; bail without writing to
-    # avoid corrupting the file further.
-    sys.exit(1)
+    insert_at = enabled_idx + 1
 lines.insert(insert_at, new_item_line)
 path.write_text("\n".join(lines) + "\n")
 PY
@@ -1278,6 +1431,9 @@ install_hermes() {
   local src="$INTEGRATIONS/hermes/agency-agents-router"
   local hermes_home; hermes_home="$(hermes_home_dir)"
   local dest; dest="$(resolve_dest hermes "${hermes_home}/plugins/agency-agents-router")"
+  # Strip trailing slashes first: basename ignores them, but `rm -rf link/`
+  # follows a symlink and empties its target instead of removing the link.
+  while [[ "$dest" == */ && "$dest" != "/" ]]; do dest="${dest%/}"; done
   # HERMES_PLUGIN_DIR is ambiguous: its name invites setting it to the plugins
   # parent (~/.hermes/plugins) rather than the full plugin path. Always target
   # the agency-agents-router subdir so we never rm -rf a shared plugins dir that
@@ -1295,7 +1451,22 @@ install_hermes() {
     err "Hermes: refusing to remove '$dest' — expected an agency-agents-router directory."
     return 1
   fi
-  rm -rf "$dest"
+  # The basename alone does not establish ownership: --path or an existing
+  # Hermes setup may point here with unrelated user files. Replace only a
+  # previous copy of this plugin, identified by its generated manifest.
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    if [[ ! -f "$dest/plugin.yaml" ]] || \
+       ! grep -Eq '^[[:space:]]*name:[[:space:]]*agency-agents-router[[:space:]]*$' "$dest/plugin.yaml"; then
+      err "Hermes: refusing to replace '$dest' because it is not an existing agency-agents-router plugin."
+      return 1
+    fi
+  fi
+  # A symlink (e.g. from an earlier --link install) is replaced, never followed.
+  if [[ -L "$dest" ]]; then
+    rm -f -- "$dest"
+  else
+    rm -rf -- "$dest"
+  fi
   if $USE_LINK; then
     ln -s "$src" "$dest"
   else
@@ -1343,6 +1514,9 @@ install_tool() {
 # Entry point
 # ---------------------------------------------------------------------------
 main() {
+  SKIPPED_LOG="$(mktemp "${TMPDIR:-/tmp}/agency-install-skipped.XXXXXX")"
+  export SKIPPED_LOG
+  trap 'rm -f "$SKIPPED_LOG"' EXIT
   local tool="all"
   local interactive_mode="auto"
   local use_parallel=false
@@ -1411,23 +1585,6 @@ main() {
       $duplicate || _cleaned+=("$_t")
     done
     _tool_list=("${_cleaned[@]}")
-    # --path is one shared directory. Tools that write the same filenames into
-    # it silently overwrite each other; tools with distinct outputs coexist.
-    # Refuse only the colliding combinations (see path_collision_group).
-    if [[ -n "$OVERRIDE_PATH" && ${#_tool_list[@]} -gt 1 ]]; then
-      local _ta _tb _ga _gb
-      for _ta in "${_tool_list[@]}"; do
-        _ga="$(path_collision_group "$_ta")"; [[ -z "$_ga" ]] && continue
-        for _tb in "${_tool_list[@]}"; do
-          [[ "$_tb" == "$_ta" ]] && continue
-          _gb="$(path_collision_group "$_tb")"
-          if [[ "$_ga" == "$_gb" ]]; then
-            err "--path is one shared directory, and $_ta and $_tb write the same filenames into it — they would overwrite each other. Use one of them per --path (tools with distinct outputs may share one)."
-            exit 1
-          fi
-        done
-      done
-    fi
   fi
 
   # Decide whether to show interactive UI
@@ -1468,6 +1625,9 @@ main() {
     dim "  Available: ${ALL_TOOLS[*]}"
     exit 0
   fi
+
+  # --tool all and the interactive wizard only know their selected tools now.
+  validate_path_collisions "${SELECTED_TOOLS[@]}"
 
   # --dry-run: print the plan and exit without writing anything.
   if $DRY_RUN; then
@@ -1547,6 +1707,11 @@ main() {
   box_row "${C_GREEN}${C_BOLD}${msg}${C_RESET}"
   box_bot
   printf "\n"
+  if [[ -s "$SKIPPED_LOG" ]]; then
+    warn "Not installed: $(wc -l < "$SKIPPED_LOG" | tr -d ' ') file(s) whose destination is a symlink to somewhere else:"
+    sed 's/^/    /' "$SKIPPED_LOG" >&2
+    warn "Remove or replace those links, then re-run to install them."
+  fi
   dim "  Run ./scripts/convert.sh to regenerate after adding or editing agents."
   printf "\n"
 }

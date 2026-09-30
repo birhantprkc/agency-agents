@@ -599,7 +599,8 @@ HEREDOC
 # then write at the end.
 AIDER_TMP="$(mktemp)"
 WINDSURF_TMP="$(mktemp)"
-trap 'rm -f "$AIDER_TMP" "$WINDSURF_TMP"' EXIT
+PARALLEL_OUT_DIR=""
+trap 'rm -f "$AIDER_TMP" "$WINDSURF_TMP"; [[ -z "$PARALLEL_OUT_DIR" ]] || rm -rf "$PARALLEL_OUT_DIR"' EXIT
 
 # Write Aider/Windsurf headers once
 cat > "$AIDER_TMP" <<'HEREDOC'
@@ -691,8 +692,40 @@ clean_tool_output() {
   # caller can never steer this rm -rf outside $OUT_DIR via "../" or "/".
   [[ "$1" =~ ^[a-z0-9-]+$ ]] || { echo "ERROR: clean_tool_output: refusing non-slug tool name '$1'" >&2; return 1; }
   local dir="$OUT_DIR/$1"
+  # The converter writes into this directory after cleaning it. Following a
+  # symlink here could overwrite an unrelated directory's existing agent files.
+  [[ ! -L "$dir" ]] || { error "refusing symlinked output directory: $dir"; return 1; }
   [[ -d "$dir" ]] || return 0
   find "$dir" -mindepth 1 -maxdepth 1 ! -name 'README.md' -exec rm -rf {} +
+}
+
+# Every per-agent integration writes to a path derived from the normalized
+# name. Refuse collisions before cleaning any existing output: otherwise the
+# later source file silently replaces the earlier agent in the generated tree.
+check_agent_slug_collisions() {
+  local dir dirpath file slug relative i
+  local seen_slugs=() seen_files=()
+  local collisions=0
+  for dir in "${AGENT_DIRS[@]}"; do
+    dirpath="$REPO_ROOT/$dir"
+    [[ -d "$dirpath" ]] || continue
+    while IFS= read -r -d '' file; do
+      is_agent_file "$file" || continue
+      slug="$(agent_slug "$file")"
+      [[ -n "$slug" ]] || continue
+      relative="${file#"$REPO_ROOT"/}"
+      for i in "${!seen_slugs[@]}"; do
+        if [[ "${seen_slugs[i]}" == "$slug" ]]; then
+          error "duplicate agent slug '$slug': ${seen_files[i]} and $relative"
+          collisions=$((collisions + 1))
+          break
+        fi
+      done
+      seen_slugs+=("$slug")
+      seen_files+=("$relative")
+    done < <(find "$dirpath" -name "*.md" -type f -print0)
+  done
+  (( collisions == 0 ))
 }
 
 run_conversions() {
@@ -700,12 +733,12 @@ run_conversions() {
   local count=0
 
   if [[ "$tool" == "hermes" ]]; then
-    clean_tool_output "$tool"
+    clean_tool_output "$tool" || return 1
     python3 "$SCRIPT_DIR/build-hermes-plugin.py" --repo-root "$REPO_ROOT" --out "$OUT_DIR/hermes"
     return
   fi
 
-  clean_tool_output "$tool"
+  clean_tool_output "$tool" || return 1
 
   for dir in "${AGENT_DIRS[@]}"; do
     local dirpath="$REPO_ROOT/$dir"
@@ -772,6 +805,8 @@ main() {
     exit 1
   fi
 
+  check_agent_slug_collisions || exit 1
+
   header "The Agency -- Converting agents to tool-specific formats"
   echo "  Repo:   $REPO_ROOT"
   echo "  Output: $OUT_DIR"
@@ -796,16 +831,25 @@ main() {
     # Tools that write to separate dirs can run in parallel; buffer output so each tool's output stays together
     local parallel_tools=(antigravity gemini-cli opencode cursor openclaw qwen zcode kimi codex osaurus hermes vibe dsh)
     local parallel_out_dir
-    parallel_out_dir="$(mktemp -d)"
+    parallel_out_dir="$(mktemp -d "${TMPDIR:-/tmp}/agency-convert-parallel.XXXXXX")"
+    PARALLEL_OUT_DIR="$parallel_out_dir"
     info "Converting: ${#parallel_tools[@]}/${n_tools} tools in parallel (output buffered per tool)..."
     export AGENCY_CONVERT_OUT_DIR="$parallel_out_dir"
     export AGENCY_CONVERT_SCRIPT="$SCRIPT_DIR/convert.sh"
     export AGENCY_CONVERT_OUT="$OUT_DIR"
-    printf '%s\n' "${parallel_tools[@]}" | xargs -P "$parallel_jobs" -I {} sh -c '"$AGENCY_CONVERT_SCRIPT" --tool "{}" --out "$AGENCY_CONVERT_OUT" > "$AGENCY_CONVERT_OUT_DIR/{}" 2>&1'
+    local parallel_status=0
+    printf '%s\n' "${parallel_tools[@]}" | xargs -P "$parallel_jobs" -I {} sh -c '"$AGENCY_CONVERT_SCRIPT" --tool "{}" --out "$AGENCY_CONVERT_OUT" > "$AGENCY_CONVERT_OUT_DIR/{}" 2>&1' || parallel_status=$?
     for t in "${parallel_tools[@]}"; do
-      [[ -f "$parallel_out_dir/$t" ]] && cat "$parallel_out_dir/$t"
+      if [[ -f "$parallel_out_dir/$t" ]]; then
+        cat "$parallel_out_dir/$t"
+      fi
     done
     rm -rf "$parallel_out_dir"
+    PARALLEL_OUT_DIR=""
+    if (( parallel_status != 0 )); then
+      error "Parallel conversion failed (xargs exit $parallel_status); see tool output above."
+      return "$parallel_status"
+    fi
     local idx=$(( ${#parallel_tools[@]} + 1 ))
     for t in aider windsurf; do
       progress_bar "$idx" "$n_tools"
